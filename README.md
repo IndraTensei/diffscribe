@@ -16,6 +16,10 @@ No LLM. No cloud. No dependencies. Just smart heuristics and your diff.
 - ✏️ **Interactive mode** — accept, customize, or override the suggested message
 - 📋 **JSON output** — machine-readable format for CI/build scripts
 - ⚡ **Zero dependencies** — pure Python 3.10+ stdlib
+- 🌿 **Branch-aware detection** — reads type/scope from branch names like `feature/api-auth` or `fix/memory-leak`
+- 📋 **Clipboard support** — `--copy` copies the suggested message to your system clipboard
+- ✏️ **Amend support** — `--amend` amends the last commit with the generated message
+- ⚙️ **Config file** — persistent settings via `.diffscribe.toml` or `.diffscribe.json`
 
 ## Installation
 
@@ -80,12 +84,14 @@ diffscribe [options]
 | `--scope SCOPE` | | Override detected scope (e.g., `api`, `auth`, `cli`) |
 | `--short` | `-s` | Print only the one-line message |
 | `--commit` | | Analyze and immediately `git commit` |
+| `--amend` | | Analyze and `git commit --amend` the last commit |
+| `--copy` | | Copy the generated message to clipboard |
 | `--interactive` | `-i` | Interactive: accept, edit, override, or skip |
 | `--json` | | Output full analysis as JSON |
-| `--emojis` | | Include emoji prefixes (default: on) |
+| `--emojis` | | Include emoji prefixes (default: on; configurable via `.diffscribe.toml`) |
 | `--no-emojis` | | Disable emoji prefixes |
 | `--cta` | | Add tracking tail (`Reviewed-by: diffscribe`) |
-| `--verbose` | `-v` | Show repo name, branch, stats before message |
+| `--verbose` | `-v` | Show repo name, branch, stats, and branch hints before message |
 | `--help` | `-h` | Show help |
 
 ## Examples
@@ -124,6 +130,36 @@ diffscribe -i
 # >
 ```
 
+### Copy to clipboard
+
+```bash
+git add src/api/routes.py
+diffscribe --copy
+# 📋 Copied to clipboard: ✨ feat(api): add Python module routes.py
+```
+
+### Amend the last commit
+
+```bash
+git add src/auth/patch.py
+diffscribe --amend --verbose
+# Branch:      fix/auth-bug
+# Repository:  myproject
+# Files:       1
+# Additions:   3
+# Deletions:   1
+# Branch hint: type=fix, scope=auth-bug
+# Suggested:   fix(auth-bug)
+#
+# 🐛 fix(auth-bug): update patch.py
+#
+# Changes:
+# - src/auth/patch.py (+3/-1)
+#
+# [diffscribe] 3 additions, 1 deletions across 1 file(s)
+# ✅ Amended last commit successfully!
+```
+
 ### Full commit with verbose info
 
 ```bash
@@ -155,8 +191,52 @@ diffscribe --commit --verbose
 3. **Classifies each file** using heuristics:
    - Path-based: `test/`, `.github/`, `Dockerfile`, `.eslintrc`, etc.
    - Content-based: regex scans of diff hunks for fix/perf/refactor patterns
-4. **Aggregates** — picks the dominant commit type and most common scope
-5. **Generates** a conventional commit message following the [Conventional Commits v1.0.0](https://www.conventionalcommits.org/) spec
+4. **Checks branch name** — if the branch follows conventions like `feature/add-login` or `fix/memory-leak`, the type and scope are extracted
+5. **Loads config** — reads `.diffscribe.toml` or `.diffscribe.json` from the repo (or any parent directory) for default settings
+6. **Aggregates** — picks the dominant commit type and most common scope
+7. **Generates** a conventional commit message following the [Conventional Commits v1.0.0](https://www.conventionalcommits.org/) spec
+
+## Config File
+
+Create a `.diffscribe.toml` (or `.diffscribe.json`) in your repo root to set default options:
+
+### TOML format
+
+```toml
+# .diffscribe.toml
+[diffscribe]
+emojis = true
+verbose = false
+cta = false
+scope = "my-project"
+type = ""
+```
+
+### JSON format
+
+```json
+{
+  "diffscribe": {
+    "emojis": true,
+    "verbose": false,
+    "cta": false,
+    "scope": "my-project",
+    "type": ""
+  }
+}
+```
+
+Config file settings are defaults — CLI flags always take precedence. The tool searches for config files starting from the current directory and walks up parent directories.
+
+### Supported config keys
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `emojis` | bool | Whether to include emoji prefixes (default: `true`) |
+| `verbose` | bool | Whether to show detailed branch/stats info (default: `false`) |
+| `cta` | bool | Whether to add `Reviewed-by: diffscribe` tail (default: `false`) |
+| `scope` | string | Default scope override (empty = auto-detect) |
+| `type` | string | Default type override (empty = auto-detect) |
 
 ## Requirements
 

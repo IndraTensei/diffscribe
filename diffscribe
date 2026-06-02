@@ -7,8 +7,11 @@ detects scope, and outputs a well-structured conventional commit message.
 No API keys, no AI models — just smart diff analysis.
 """
 
+__version__ = "1.2.0"
+
 import os
 import re
+import shutil
 import subprocess
 import sys
 import argparse
@@ -132,6 +135,202 @@ STYLE_PATTERNS = [
     r"\bindent\b", r"\btrailing\b", r"\bsemicolon\b", r"\bprettier",
     r"\bblack\b", r"\beslint",
 ]
+
+# ---------------------------------------------------------------------------
+# Config file support
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "emojis": True,
+    "type": "",
+    "scope": "",
+    "cta": False,
+    "verbose": False,
+}
+
+CONVENTIONAL_TYPE_PREFIXES = {
+    "feat": "feat",
+    "feature": "feat",
+    "fix": "fix",
+    "bug": "fix",
+    "bugfix": "fix",
+    "hotfix": "fix",
+    "docs": "docs",
+    "doc": "docs",
+    "style": "style",
+    "refactor": "refactor",
+    "refact": "refactor",
+    "perf": "perf",
+    "performance": "perf",
+    "test": "test",
+    "testing": "test",
+    "ci": "ci",
+    "chore": "chore",
+    "build": "build",
+    "revert": "revert",
+    "release": "chore",
+}
+
+
+def find_config_path() -> str:
+    """Look for .diffscribe config files in the current directory and parents."""
+    candidates = [
+        ".diffscribe.toml",
+        ".diffscribe.json",
+        ".config/.diffscribe.toml",
+        ".config/.diffscribe.json",
+    ]
+    cur = os.getcwd()
+    while True:
+        for name in candidates:
+            full = os.path.join(cur, name)
+            if os.path.isfile(full):
+                return full
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return ""
+
+
+def load_config() -> dict:
+    """Load config from a .diffscribe.toml or .diffscribe.json file."""
+    path = find_config_path()
+    if not path:
+        return dict(DEFAULT_CONFIG)
+
+    try:
+        if path.endswith(".toml"):
+            # Try tomllib first (Python 3.11+), fallback to toml, else skip
+            try:
+                import tomllib
+                with open(path, "rb") as f:
+                    raw = tomllib.load(f)
+            except ImportError:
+                try:
+                    import tomli as tomllib
+                    with open(path, "rb") as f:
+                        raw = tomllib.load(f)
+                except ImportError:
+                    # Fallback: minimal TOML-like parser for our simple cases
+                    raw = _parse_minimal_toml(path)
+        else:
+            import json
+            with open(path) as f:
+                raw = json.load(f)
+
+        # Support [[diffscribe]] table (TOML) or top-level (JSON)
+        if isinstance(raw, dict):
+            if "diffscribe" in raw:
+                raw = raw["diffscribe"]
+            cfg = dict(DEFAULT_CONFIG)
+            for key in ("emojis", "type", "scope", "cta", "verbose"):
+                if key in raw:
+                    cfg[key] = raw[key]
+            return cfg
+    except Exception:
+        pass
+
+    return dict(DEFAULT_CONFIG)
+
+
+def _parse_minimal_toml(path: str) -> dict:
+    """Minimal TOML parser — handles flat key = value and [section] headers."""
+    result: dict = {}
+    current_section = result
+    section_map: dict = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            section_match = re.match(r"^\[(.+?)\]$", line)
+            if section_match:
+                name = section_match.group(1).strip()
+                current_section = {}
+                section_map[name] = current_section
+                continue
+            kv_match = re.match(r'^(\w+)\s*=\s*(.+)$', line)
+            if kv_match:
+                key = kv_match.group(1).strip()
+                val = kv_match.group(2).strip()
+                # Strip quotes
+                if val.startswith('"') and val.endswith('"'):
+                    val = val[1:-1]
+                elif val.startswith("'") and val.endswith("'"):
+                    val = val[1:-1]
+                # Booleans
+                elif val.lower() == "true":
+                    val = True
+                elif val.lower() == "false":
+                    val = False
+                # Numbers
+                else:
+                    try:
+                        val = int(val)
+                    except ValueError:
+                        try:
+                            val = float(val)
+                        except ValueError:
+                            pass
+                current_section[key] = val
+    # Merge sections: top-level keys + all section values
+    merged = dict(result)
+    for s in section_map.values():
+        merged.update(s)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Branch-aware type/scope detection
+# ---------------------------------------------------------------------------
+
+# Matches branch names like: feature/add-login, fix/memory-leak, docs/readme, feat/api-auth
+BRANCH_TYPE_RE = re.compile(
+    r"^(?P<trunk>[^/]+/)?"
+    r"(?P<type>feat|feature|fix|bugfix|hotfix|bug|docs|doc|style|refactor|refact|perf|performance|test|testing|ci|chore|build|revert|release)"
+    r"(/(?P<scope>.+))?$"
+)
+
+# Simpler pattern for common branches without type prefix (just scope)
+BRANCH_SCOPE_RE = re.compile(
+    r"^(?P<scope>[a-zA-Z0-9_-]+)/(?P<rest>.+)$"
+)
+
+
+def detect_from_branch(branch_name: str) -> tuple:
+    """
+    Parse the branch name to guess commit type and scope.
+    Returns (type_hint, scope_hint) — either may be empty string.
+
+    Examples:
+        feature/api-auth  → ("feat", "api-auth")
+        fix/memory-leak   → ("fix", "memory-leak")
+        docs/readme       → ("docs", "readme")
+        main              → ("", "")
+    """
+    # Strip common remote prefixes
+    for prefix in ("origin/", "refs/heads/"):
+        if branch_name.startswith(prefix):
+            branch_name = branch_name[len(prefix):]
+
+    m = BRANCH_TYPE_RE.match(branch_name)
+    if m:
+        raw_type = m.group("type") or ""
+        mapped = CONVENTIONAL_TYPE_PREFIXES.get(raw_type, "")
+        detected_scope = m.group("scope") or ""
+        return (mapped, detected_scope)
+
+    # For branches like "some-scope/description", extract scope if it looks meaningful
+    m2 = BRANCH_SCOPE_RE.match(branch_name)
+    if m2:
+        candidate_scope = m2.group("scope")
+        # Don't use generic names as scope
+        generic = {"src", "lib", "test", "tests", "spec", "scripts", "utils", "helpers"}
+        if candidate_scope.lower() not in generic:
+            return ("", candidate_scope)
+
+    return ("", "")
 
 
 def _matches_any(text: str, patterns: list[str]) -> bool:
@@ -601,12 +800,78 @@ def do_commit(message: str) -> bool:
         return False
 
 
+def do_amend(message: str) -> bool:
+    """Amend the last commit with the given message."""
+    try:
+        _run_git("commit", "--amend", "-m", message)
+        return True
+    except RuntimeError as e:
+        print(f"Amend failed: {e}", file=sys.stderr)
+        return False
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to the system clipboard. Returns True on success."""
+    # Try platform-specific clipboard commands
+    clipboard_cmd = None
+    if shutil.which("xclip"):
+        clipboard_cmd = ["xclip", "-selection", "clipboard"]
+    elif shutil.which("xsel"):
+        clipboard_cmd = ["xsel", "--clipboard", "--input"]
+    elif shutil.which("pbcopy"):
+        clipboard_cmd = ["pbcopy"]
+    elif shutil.which("wl-copy"):
+        clipboard_cmd = ["wl-copy"]
+    elif sys.platform == "win32":
+        clipboard_cmd = ["clip"]
+    elif sys.platform == "darwin" and not shutil.which("pbcopy"):
+        # macOS without pbcopy — shouldn't happen
+        pass
+
+    if clipboard_cmd is None:
+        return False
+
+    try:
+        proc = subprocess.run(
+            clipboard_cmd,
+            input=text.encode("utf-8"),
+            timeout=10,
+            capture_output=True,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
 
+def _format_commit_message_no_emoji(summary: DiffSummary, scope: str = "", cta: bool = False) -> str:
+    """Format the full commit message without emojis."""
+    scope = scope or summary.suggested_scope
+    scope_str = f"({scope})" if scope else ""
+    header = f"{summary.suggested_type}{scope_str}: {summary.short_description}"
+    lines = [header]
+    if summary.details:
+        lines.append("")
+        lines.append("Changes:")
+        lines.extend(summary.details[:20])
+        if len(summary.details) > 20:
+            lines.append(f"- ... and {len(summary.details) - 20} more files")
+    lines.append("")
+    lines.append(f"[diffscribe] {summary.total_additions} additions, {summary.total_deletions} deletions across {len(summary.files)} file(s)")
+    if cta:
+        lines.append("")
+        lines.append("Reviewed-by: diffscribe (automated analysis)")
+    return "\n".join(lines)
+
+
 def main() -> int:
+    # Load config file first (before parsing CLI args, so CLI overrides config)
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(
         prog="diffscribe",
         description="Analyze staged git diffs and generate conventional commit messages.",
@@ -617,6 +882,8 @@ examples:
   diffscribe -s                 # Show short one-liner only
   diffscribe -i                 # Interactive mode (accept/edit/override)
   diffscribe --commit           # Analyze and immediately commit
+  diffscribe --amend            # Amend the last commit with a new message
+  diffscribe --copy             # Copy the message to clipboard
   diffscribe --type fix         # Override the detected commit type
   diffscribe --scope api        # Override the detected scope
   diffscribe --json             # Output machine-readable JSON
@@ -639,6 +906,17 @@ examples:
         help="Automatically commit with the generated message",
     )
     parser.add_argument(
+        "--amend",
+        action="store_true",
+        help="Amend the last commit with the generated message",
+    )
+    parser.add_argument(
+        "--copy",
+        action="store_true",
+        dest="copy",
+        help="Copy the generated message to the system clipboard",
+    )
+    parser.add_argument(
         "--type", "-t",
         dest="commit_type",
         choices=["feat", "fix", "docs", "style", "refactor", "perf", "test", "ci", "chore", "build", "revert"],
@@ -658,8 +936,8 @@ examples:
     parser.add_argument(
         "--emojis",
         action="store_true",
-        default=True,
-        help="Include emoji in the commit message (default: on)",
+        default=None,
+        help="Include emoji in the commit message (default: on; can be set in .diffscribe config)",
     )
     parser.add_argument(
         "--no-emojis",
@@ -670,15 +948,34 @@ examples:
     parser.add_argument(
         "--cta",
         action="store_true",
+        default=False,
         help="Add a completion/tracking tail to the message",
     )
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
+        default=False,
         help="Show detailed analysis output",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"diffscribe {__version__}",
     )
 
     args = parser.parse_args()
+
+    # Apply config file defaults for args not explicitly set
+    if args.emojis is None:
+        args.emojis = cfg.get("emojis", True)
+    if not args.scope and cfg.get("scope"):
+        args.scope = cfg["scope"]
+    if not args.commit_type and cfg.get("type"):
+        args.commit_type = cfg["type"]
+    if not args.cta and cfg.get("cta"):
+        args.cta = cfg["cta"]
+    if not args.verbose and cfg.get("verbose"):
+        args.verbose = cfg["verbose"]
 
     # Verify we're in a git repo
     try:
@@ -700,7 +997,17 @@ examples:
         print("No analyzable staged changes found.")
         return 0
 
-    # Apply overrides
+    # Branch-aware type/scope detection
+    branch_name = get_branch_name()
+    branch_type, branch_scope = detect_from_branch(branch_name)
+
+    # Apply branch hints only when no explicit override is given
+    if not args.commit_type and branch_type:
+        summary.suggested_type = branch_type
+    if not args.scope and branch_scope:
+        summary.suggested_scope = branch_scope
+
+    # Apply explicit overrides (CLI args / config)
     if args.commit_type:
         summary.suggested_type = args.commit_type
     if args.scope:
@@ -709,13 +1016,10 @@ examples:
             summary.files, summary.suggested_type, args.scope,
         )
 
-    if not args.emojis:
-        # Temporarily override format to strip emojis — simplest approach
-        pass  # handled in format_commit_message via flag logic
-
     # Handle --json output
     if args.json:
         import json
+        message_text = _format_commit_message_no_emoji(summary, args.scope, args.cta) if not args.emojis else format_commit_message(summary, args.scope, args.cta)
         output = {
             "type": summary.suggested_type,
             "scope": summary.suggested_scope,
@@ -734,7 +1038,7 @@ examples:
                 }
                 for fc in summary.files
             ],
-            "message": format_commit_message(summary, args.scope, args.cta),
+            "message": message_text,
         }
         print(json.dumps(output, indent=2))
         return 0
@@ -745,11 +1049,10 @@ examples:
         return 0
 
     # Generate message
-    message = format_commit_message(summary, args.scope, args.cta)
-
-    if not args.emojis:
-        # Strip emoji characters from the message
-        message = re.sub(r"[^\x00-\x7F]+", "", message).strip()
+    if args.emojis:
+        message = format_commit_message(summary, args.scope, args.cta)
+    else:
+        message = _format_commit_message_no_emoji(summary, args.scope, args.cta)
 
     # Handle verbose
     if args.verbose:
@@ -758,15 +1061,41 @@ examples:
         print(f"Files:       {len(summary.files)}")
         print(f"Additions:   {summary.total_additions}")
         print(f"Deletions:   {summary.total_deletions}")
+        # Show branch hint info
+        if branch_type:
+            print(f"Branch hint: type={branch_type}" + (f", scope={branch_scope}" if branch_scope else ""))
         print(f"Suggested:   {summary.suggested_type}" +
               (f"({summary.suggested_scope})" if summary.suggested_scope else ""))
         print()
+
+    # Handle --copy (copy to clipboard, optionally also print)
+    if args.copy:
+        if args.emojis:
+            full_msg = format_commit_message(summary, args.scope, args.cta)
+            commit_line = full_msg.splitlines()[0]
+        else:
+            commit_line = format_short_status(summary)
+        if copy_to_clipboard(commit_line):
+            print(f"📋 Copied to clipboard: {commit_line}")
+        else:
+            print("Warning: Could not copy to clipboard (no clipboard tool found).", file=sys.stderr)
+            print(commit_line)
+        if not args.commit and not args.amend:
+            return 0
 
     if args.commit:
         print(message)
         print()
         if do_commit(message):
             print("✅ Committed successfully!")
+            return 0
+        return 1
+
+    if args.amend:
+        print(message)
+        print()
+        if do_amend(message):
+            print("✅ Amended last commit successfully!")
             return 0
         return 1
 
