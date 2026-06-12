@@ -20,6 +20,14 @@ No LLM. No cloud. No dependencies. Just smart heuristics and your diff.
 - 📋 **Clipboard support** — `--copy` copies the suggested message to your system clipboard
 - ✏️ **Amend support** — `--amend` amends the last commit with the generated message
 - ⚙️ **Config file** — persistent settings via `.diffscribe.toml` or `.diffscribe.json`
+- 🛠️ **Git hook integration** — `--hook` installs a `prepare-commit-msg` hook for automatic commit messages
+- 🔍 **Dry-run mode** — `--dry-run` previews the commit message without actually committing
+- 📊 **ASCII diff bar** — `--verbose` now shows an ASCII visualization of additions vs deletions
+- 🏷️ **Type breakdown** — `--verbose` shows a per-type count (e.g. `feat:2, docs:1`)
+- ✍️ **Sign-off support** — `--signoff` adds a rich body with type-grouped files and a `Signed-off-by` line
+- 🎨 **Custom templates** — `--template` with placeholders like `{type}`, `{scope}`, `{subject}`, `{hash}`, `{date}`
+- 📜 **Commit history** — `--history` shows recent commits for style consistency
+- 🔍 **Commit linter** — `--lint` validates any message against the Conventional Commits v1.0.0 spec
 
 ## Installation
 
@@ -91,8 +99,16 @@ diffscribe [options]
 | `--emojis` | | Include emoji prefixes (default: on; configurable via `.diffscribe.toml`) |
 | `--no-emojis` | | Disable emoji prefixes |
 | `--cta` | | Add tracking tail (`Reviewed-by: diffscribe`) |
-| `--verbose` | `-v` | Show repo name, branch, stats, and branch hints before message |
-| `--help` | `-h` | Show help |
+| `--verbose` | `-v` | Show repo name, branch, stats, ASCII diff bar, type breakdown, and branch hints |
+| `--hook` | | Install diffscribe as a `prepare-commit-msg` git hook |
+| `--force` | | Force overwrite when used with `--hook` |
+| `--dry-run` | | Preview the commit message without actually committing |
+| `--signoff` | | Add a rich body with type-grouped files and `Signed-off-by` line|
+| `--template T` | `-T` | Custom output template (placeholders: `{emoji}` `{type}` `{scope}` `{subject}` `{files}` `{additions}` `{deletions}` `{branch}` `{repo}` `{hash}` `{date}`)|
+| `--history` | | Show recent commit history for style reference|
+| `--lint [MSG]` | | Lint a commit message against Conventional Commits spec (reads stdin if no argument, or pass a message/file path)|
+| `--help` | `-h` | Show help|
+| `--version` | | Show version number|
 
 ## Examples
 
@@ -158,6 +174,54 @@ diffscribe --amend --verbose
 #
 # [diffscribe] 3 additions, 1 deletions across 1 file(s)
 # ✅ Amended last commit successfully!
+```
+
+### Custom templates
+
+```bash
+git add src/api/routes.py
+diffscribe -T "{type}{scope}: {subject} [{hash}]"
+# => feat(api): add Python module routes.py [a1b2c3d4]
+
+diffscribe -T "{date} {type}{scope}: {subject} (+{additions}/-{deletions})"
+# => 2026-06-12 feat(api): add Python module routes.py (+42/-0)
+
+diffscribe --no-emojis -T "{type}{scope}: {subject} ({branch})"
+# => feat(api): add Python module routes.py (feature/api-auth)
+```
+
+### Commit history
+
+```bash
+diffscribe --history
+# 📜 Recent 10 commit(s) for style reference:
+#
+#   a1b2c3d4  3 days ago   feat(api): add user authentication
+#   e5f6g7h8  5 days ago   fix(auth): resolve token expiry bug
+#   ...
+```
+
+### Lint a commit message
+
+```bash
+# Lint a message directly
+diffscribe --lint "feat(api): add user authentication"
+# ✅ Commit message looks good!
+#    type=feat, scope=api, subject="add user authentication"
+
+# Lint from stdin
+echo "WIP: working on stuff" | diffscribe --lint
+# ❌ Commit message does NOT conform to Conventional Commits:
+#    ✗ Header does not match Conventional Commits format: 'WIP: working on stuff'
+#    ✗ Expected format: <type>[(scope)][!]: <subject>
+#    ✗ Allowed types: build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test
+#    ⚠ Starts with 'wip' — conventional commits should describe the result, not work-in-progress
+
+# Lint a file
+echo "fix: resolve memory leak" > /tmp/commit-msg.txt
+diffscribe --lint /tmp/commit-msg.txt
+# ✅ Commit message looks good!
+#    type=fix, subject="resolve memory leak"
 ```
 
 ### Full commit with verbose info

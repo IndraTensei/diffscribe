@@ -7,7 +7,7 @@ detects scope, and outputs a well-structured conventional commit message.
 No API keys, no AI models — just smart diff analysis.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 
 import os
 import re
@@ -137,8 +137,129 @@ STYLE_PATTERNS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Config file support
+# Git hook integration
 # ---------------------------------------------------------------------------
+
+HOOK_SCRIPT = (
+    "#!/usr/bin/env bash\n"
+    "# diffscribe git hook — prepare-commit-msg\n"
+    "# Installs diffscribe as a prepare-commit-msg hook that auto-generates\n"
+    "# commit messages when the user does not provide one.\n"
+    "set -euo pipefail\n"
+    "\n"
+    "# Only auto-generate if no commit message provided (i.e., editor would open)\n"
+    'if [ -z "$2" ]; then\n'
+    '    MESSAGE="$(diffscribe --no-emojis -s 2>/dev/null || echo "")"\n'
+    '    if [ -n "$MESSAGE" ]; then\n'
+    '        echo "$MESSAGE" > "$1"\n'
+    "    fi\n"
+    "fi\n"
+)
+
+HOOK_PATH = ".git/hooks/prepare-commit-msg"
+
+
+def install_hook(force: bool = False) -> bool:
+    """Install the diffscribe prepare-commit-msg hook into the current repo."""
+    try:
+        _run_git("rev-parse", "--is-inside-work-tree")
+    except RuntimeError:
+        print("Error: Not inside a git repository.", file=sys.stderr)
+        return False
+
+    hook_path = os.path.join(os.getcwd(), HOOK_PATH)
+
+    if os.path.exists(hook_path) and not force:
+        print(f"Hook already exists: {hook_path}")
+        print("Use --hook --force to overwrite.")
+        return False
+
+    os.makedirs(os.path.dirname(hook_path), exist_ok=True)
+    with open(hook_path, "w") as f:
+        f.write(HOOK_SCRIPT)
+    os.chmod(hook_path, 0o755)
+    print(f"✅ Installed diffscribe prepare-commit-msg hook -> {hook_path}")
+    print("   diffscribe will auto-generate commit messages when you commit without -m.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Rich commit body template
+# ---------------------------------------------------------------------------
+
+def build_rich_body(summary: DiffSummary, signoff: bool = False) -> str:
+    """Build a rich commit message body with stats and file breakdown."""
+    lines = []
+
+    # File change summary by type
+    type_groups: dict[str, list] = defaultdict(list)
+    for fc in summary.files:
+        label = fc.change_type or "change"
+        type_groups[label].append(fc)
+
+    if type_groups:
+        lines.append("")
+        lines.append("Changes:")
+        priority = ["feat", "fix", "perf", "refactor", "test", "docs", "ci", "style", "chore"]
+        ordered = []
+        for t in priority:
+            if t in type_groups:
+                ordered.append(t)
+        for t in type_groups:
+            if t not in priority:
+                ordered.append(t)
+
+        for t in ordered:
+            fcs = type_groups[t]
+            if len(fcs) <= 3:
+                for fc in fcs:
+                    prefix = ""
+                    if fc.is_new:
+                        prefix = "(new) "
+                    elif fc.is_deleted:
+                        prefix = "(deleted) "
+                    lines.append(f"- {prefix}{fc.path} (+{fc.additions}/-{fc.deletions})")
+            else:
+                lines.append(f"- {t}: {len(fcs)} file(s)")
+                for fc in fcs[:2]:
+                    lines.append(f"  - {fc.path} (+{fc.additions}/-{fc.deletions})")
+                if len(fcs) > 2:
+                    lines.append(f"  - ... and {len(fcs) - 2} more")
+
+    # Stats summary
+    lines.append("")
+    total = summary.total_additions + summary.total_deletions
+    if total > 0:
+        add_pct = int(100 * summary.total_additions / total)
+        del_pct = 100 - add_pct
+        lines.append(f"[diffscribe] +{summary.total_additions}/-{summary.total_deletions} "
+                     f"(+{add_pct}%/-{del_pct}%) across {len(summary.files)} file(s)")
+    else:
+        lines.append(f"[diffscribe] {len(summary.files)} file(s)")
+
+    if signoff:
+        lines.append("")
+        lines.append("Signed-off-by: diffscribe <noreply@indratensei.dev>")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# ASCII diff bar visualization
+# ---------------------------------------------------------------------------
+
+def render_diff_bar(additions: int, deletions: int, width: int = 20) -> str:
+    """Render an ASCII bar showing the ratio of additions vs deletions."""
+    total = additions + deletions
+    if total == 0:
+        return "│" + " " * width + "│"
+    add_units = max(1, int(width * additions / total)) if additions > 0 else 0
+    del_units = width - add_units
+    if del_units == 0 and deletions > 0:
+        del_units = 1
+        add_units = width - 1
+    bar = "+" * add_units + "-" * del_units
+    return f"│{bar}│ +{additions}/-{deletions}"
 
 DEFAULT_CONFIG = {
     "emojis": True,
@@ -146,6 +267,7 @@ DEFAULT_CONFIG = {
     "scope": "",
     "cta": False,
     "verbose": False,
+    "signoff": False,
 }
 
 CONVENTIONAL_TYPE_PREFIXES = {
@@ -224,7 +346,7 @@ def load_config() -> dict:
             if "diffscribe" in raw:
                 raw = raw["diffscribe"]
             cfg = dict(DEFAULT_CONFIG)
-            for key in ("emojis", "type", "scope", "cta", "verbose"):
+            for key in ("emojis", "type", "scope", "cta", "verbose", "signoff"):
                 if key in raw:
                     cfg[key] = raw[key]
             return cfg
@@ -886,7 +1008,13 @@ examples:
   diffscribe --copy             # Copy the message to clipboard
   diffscribe --type fix         # Override the detected commit type
   diffscribe --scope api        # Override the detected scope
-  diffscribe --json             # Output machine-readable JSON
+  diffscribe --hook                    # Install git prepare-commit-msg hook
+  diffscribe --dry-run                 # Preview what would be committed
+  diffscribe --signoff                 # Add Signed-off-by line to message
+  diffscribe --json                    # Output machine-readable JSON
+  diffscribe -T "{type}{scope}: {subject} [{hash}]"  # Custom template
+  diffscribe --history                 # Show recent commits for style reference
+  diffscribe --lint "feat: add thing"  # Lint a commit message
         """,
     )
 
@@ -952,10 +1080,54 @@ examples:
         help="Add a completion/tracking tail to the message",
     )
     parser.add_argument(
+        "--hook",
+        action="store_true",
+        default=False,
+        help="Install diffscribe as a prepare-commit-msg git hook",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force overwrite when installing hook",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Show what would be committed without actually committing",
+    )
+    parser.add_argument(
+        "--signoff",
+        action="store_true",
+        default=False,
+        help="Add a 'Signed-off-by: diffscribe' line to the message",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         default=False,
-        help="Show detailed analysis output",
+        help="Show detailed analysis output (ASCII diff bar, type breakdown)",
+    )
+    parser.add_argument(
+        "--template", "-T",
+        dest="template",
+        default="",
+        help="Custom output template. Placeholders: {emoji} {type} {scope} {subject} {files} {additions} {deletions} {branch} {repo} {hash} {date}",
+    )
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        default=False,
+        help="Show recent commit history for style reference",
+    )
+    parser.add_argument(
+        "--lint",
+        nargs="?",
+        const="__stdin__",
+        default=None,
+        metavar="MESSAGE_OR_FILE",
+        help="Lint a commit message against Conventional Commits spec. Reads from stdin if no argument.",
     )
     parser.add_argument(
         "--version",
@@ -976,6 +1148,8 @@ examples:
         args.cta = cfg["cta"]
     if not args.verbose and cfg.get("verbose"):
         args.verbose = cfg["verbose"]
+    if not args.signoff and cfg.get("signoff"):
+        args.signoff = cfg["signoff"]
 
     # Verify we're in a git repo
     try:
@@ -983,6 +1157,37 @@ examples:
     except RuntimeError:
         print("Error: Not inside a git repository.", file=sys.stderr)
         return 1
+
+    # Handle --history separately (no staged changes needed)
+    if args.history:
+        display_commit_history()
+        return 0
+
+    # Handle --lint separately (no staged changes needed)
+    if args.lint is not None:
+        if args.lint == "__stdin__":
+            # Read from stdin
+            try:
+                message = sys.stdin.read()
+            except KeyboardInterrupt:
+                return 1
+        elif os.path.isfile(args.lint):
+            # Read from file
+            try:
+                with open(args.lint) as f:
+                    message = f.read()
+            except IOError as e:
+                print(f"Error reading file: {e}", file=sys.stderr)
+                return 1
+        else:
+            # Treat argument as the message itself
+            message = args.lint
+        result = lint_commit_message(message)
+        return display_lint_result(result)
+
+    # Handle --hook separately (no staged changes needed)
+    if args.hook:
+        return 0 if install_hook(force=args.force) else 1
 
     # Check for staged changes
     staged_diff = get_staged_diff()
@@ -1045,22 +1250,38 @@ examples:
 
     # Handle --short
     if args.short:
-        print(format_short_status(summary))
+        if args.template:
+            print(_resolve_template(args.template, summary, emojis=args.emojis))
+        else:
+            print(format_short_status(summary))
         return 0
 
     # Generate message
-    if args.emojis:
+    if args.template:
+        message = _resolve_template(args.template, summary, emojis=args.emojis)
+    elif args.emojis:
         message = format_commit_message(summary, args.scope, args.cta)
     else:
         message = _format_commit_message_no_emoji(summary, args.scope, args.cta)
 
-    # Handle verbose
+    # Handle verbose with ASCII diff bar and type breakdown
     if args.verbose:
         print(f"Branch:      {get_branch_name()}")
         print(f"Repository:  {get_repo_name()}")
         print(f"Files:       {len(summary.files)}")
         print(f"Additions:   {summary.total_additions}")
         print(f"Deletions:   {summary.total_deletions}")
+        # ASCII diff bar
+        bar = render_diff_bar(summary.total_additions, summary.total_deletions)
+        print(f"Diff bar:    {bar}")
+        # Type breakdown
+        type_counts: dict[str, int] = defaultdict(int)
+        for fc in summary.files:
+            if fc.change_type:
+                type_counts[fc.change_type] += 1
+        if type_counts:
+            breakdown = ", ".join(f"{t}:{c}" for t, c in sorted(type_counts.items(), key=lambda x: -x[1]))
+            print(f"Breakdown:   {breakdown}")
         # Show branch hint info
         if branch_type:
             print(f"Branch hint: type={branch_type}" + (f", scope={branch_scope}" if branch_scope else ""))
@@ -1083,18 +1304,39 @@ examples:
         if not args.commit and not args.amend:
             return 0
 
+    # Build commit message for --commit or --dry-run
+    if args.signoff:
+        # Use header from the formatted message + rich body with signoff
+        header = (format_commit_message(summary, args.scope, args.cta) if args.emojis
+                  else _format_commit_message_no_emoji(summary, args.scope, args.cta))
+        # Extract just the first line (the header)
+        header_line = header.splitlines()[0]
+        body = build_rich_body(summary, signoff=True)
+        message_with_signoff = header_line + body
+    else:
+        message_with_signoff = message
+
+    if args.dry_run:
+        print("[dry-run] Would commit with message:")
+        print("─" * 50)
+        print(message_with_signoff)
+        print("─" * 50)
+        print(f"\n(dry-run) {len(summary.files)} file(s), "
+              f"+{summary.total_additions}/-{summary.total_deletions} staged for commit.")
+        return 0
+
     if args.commit:
-        print(message)
+        print(message_with_signoff)
         print()
-        if do_commit(message):
+        if do_commit(message_with_signoff):
             print("✅ Committed successfully!")
             return 0
         return 1
 
     if args.amend:
-        print(message)
+        print(message_with_signoff)
         print()
-        if do_amend(message):
+        if do_amend(message_with_signoff):
             print("✅ Amended last commit successfully!")
             return 0
         return 1
@@ -1111,8 +1353,284 @@ examples:
         return 0
 
     # Default: just print the suggested message
-    print(message)
+    print(message_with_signoff)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Custom commit message templates
+# ---------------------------------------------------------------------------
+
+# Default template used when --template is not specified
+DEFAULT_TEMPLATE = "{emoji} {type}{scope}: {subject}"
+
+# Available template placeholders:
+#   {emoji}    — emoji prefix (✨, 🐛, etc.) or empty if --no-emojis
+#   {type}     — commit type (feat, fix, docs, …)
+#   {scope}    — commit scope in parentheses, e.g. "(api)" or empty
+#   {subject}  — short subject description
+#   {files}    — number of changed files
+#   {additions} — number of additions
+#   {deletions} — number of deletions
+#   {branch}   — current branch name
+#   {repo}     — repository name
+#   {hash}     — short SHA of HEAD commit (or "uncommitted")
+#   {date}     — current date in YYYY-MM-DD format
+
+TEMPLATE_PLACEHOLDERS = [
+    "emoji", "type", "scope", "subject", "files", "additions",
+    "deletions", "branch", "repo", "hash", "date",
+]
+
+
+def _resolve_template(template: str, summary: DiffSummary,
+                      emojis: bool = True) -> str:
+    """Render a commit message from a user-supplied template string."""
+    type_emoji = {
+        "feat": "✨", "fix": "🐛", "docs": "📝", "style": "🎨",
+        "refactor": "♻️", "perf": "⚡", "test": "✅", "ci": "👷",
+        "chore": "🔧", "build": "📦", "revert": "⏪",
+    }
+    emoji = type_emoji.get(summary.suggested_type, "🔧") if emojis else ""
+    scope_str = f"({summary.suggested_scope})" if summary.suggested_scope else ""
+
+    # Gather context values
+    from datetime import datetime
+    branch_name = get_branch_name()
+    repo_name = get_repo_name()
+    try:
+        short_hash = _run_git("rev-parse", "--short", "HEAD").strip()
+    except Exception:
+        short_hash = "uncommitted"
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    replacements = {
+        "emoji": emoji,
+        "type": summary.suggested_type,
+        "scope": scope_str,
+        "subject": summary.short_description,
+        "files": str(len(summary.files)),
+        "additions": str(summary.total_additions),
+        "deletions": str(summary.total_deletions),
+        "branch": branch_name,
+        "repo": repo_name,
+        "hash": short_hash,
+        "date": today,
+    }
+
+    result = template
+    for key, val in replacements.items():
+        result = result.replace("{" + key + "}", val)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Commit history inspection
+# ---------------------------------------------------------------------------
+
+def get_recent_commits(count: int = 10) -> list[dict]:
+    """Return the N most recent commit messages with metadata."""
+    fmt = "%H%x00%s%x00%an%x00%ar%x00"
+    try:
+        raw = _run_git("log", f"-n{count}", f"--pretty=format:{fmt}")
+    except RuntimeError:
+        return []
+
+    commits = []
+    for entry in raw.strip().split("\x00\x00"):
+        entry = entry.strip("\x00").strip()
+        if not entry:
+            continue
+        parts = entry.split("\x00")
+        if len(parts) >= 4:
+            commits.append({
+                "hash": parts[0][:8],
+                "subject": parts[1],
+                "author": parts[2],
+                "date": parts[3],
+            })
+    return commits
+
+
+def display_commit_history(count: int = 10) -> None:
+    """Print recent commit history in a formatted table."""
+    commits = get_recent_commits(count)
+    if not commits:
+        print("No commit history found.")
+        return
+
+    print(f"\n📜 Recent {len(commits)} commit(s) for style reference:\n")
+    # Determine column widths
+    h_width = max(len(c["hash"]) for c in commits)
+    d_width = max(len(c["date"]) for c in commits)
+
+    for c in commits:
+        print(f"  {c['hash']:<{h_width}}  {c['date']:<{d_width}}  {c['subject']}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Conventional Commit linter
+# ---------------------------------------------------------------------------
+
+# Regex for the Conventional Commits v1.0.0 spec
+CONVENTIONAL_COMMIT_RE = re.compile(
+    r"^(?P<type>build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
+    r"(?P<breaking>!?)"
+    r"(\((?P<scope>[a-z0-9_-]+)\))?"
+    r"(?P<breaking2>!?)"
+    r": "
+    r"(?P<subject>.+)$"
+)
+
+# Allowed commit types from conventional commits spec
+CONVENTIONAL_TYPES = [
+    "build", "chore", "ci", "docs", "feat", "fix",
+    "perf", "refactor", "revert", "style", "test",
+]
+
+# Common non-conventional patterns that trigger warnings
+COMMON_MISTAKES = [
+    (re.compile(r"^wip\b", re.I), "Starts with 'wip' — conventional commits should describe the result, not work-in-progress"),
+    (re.compile(r"^update\b", re.I), "Starts with 'update' — consider a more specific type like 'feat', 'fix', or 'docs'"),
+    (re.compile(r"^add\b", re.I), "Starts with 'add' — consider using 'feat' as the type if this adds functionality"),
+    (re.compile(r"^remove\b", re.I), "Starts with 'remove' — consider 'refactor' or 'chore' as the type"),
+    (re.compile(r"^change\b", re.I), "Starts with 'change' — consider a more descriptive type"),
+    (re.compile(r"^bump\b", re.I), "Starts with 'bump' — consider 'chore' as the type for version bumps"),
+    (re.compile(r"^merge\b", re.I), "Starts with 'merge' — merge commits usually don't need conventional format"),
+    (re.compile(r"^typo\b", re.I), "Starts with 'typo' — consider 'fix' or 'docs' as the type"),
+    (re.compile(r"^\.\.\.", re.I), "Starts with '...' — the subject should be a complete description"),
+    (re.compile(r".{73,}", re.I), "Subject exceeds 72 characters — the header should be ≤72 chars"),
+]
+
+
+def lint_commit_message(message: str) -> dict:
+    """
+    Lint a commit message against the Conventional Commits v1.0.0 spec.
+
+    Returns a dict:
+    {
+        "valid": bool,
+        "matched": bool,
+        "type": str or None,
+        "scope": str or None,
+        "subject": str or None,
+        "breaking": bool,
+        "errors": [str, ...],
+        "warnings": [str, ...],
+    }
+    """
+    result = {
+        "valid": False,
+        "matched": False,
+        "type": None,
+        "scope": None,
+        "subject": None,
+        "breaking": False,
+        "errors": [],
+        "warnings": [],
+    }
+
+    # Extract the first line (header)
+    lines = message.strip().splitlines()
+    if not lines or not lines[0].strip():
+        result["errors"].append("Commit message is empty.")
+        return result
+
+    header = lines[0].strip()
+
+    # Check length
+    if len(header) > 72:
+        result["warnings"].append(
+            f"Header is {len(header)} characters (recommended max: 72)."
+        )
+
+    m = CONVENTIONAL_COMMIT_RE.match(header)
+    if m:
+        result["matched"] = True
+        result["type"] = m.group("type")
+        result["scope"] = m.group("scope")
+        result["subject"] = m.group("subject")
+        result["breaking"] = bool(m.group("breaking") or m.group("breaking2"))
+
+        # Validate subject isn't empty
+        if not m.group("subject").strip():
+            result["errors"].append("Subject must not be empty after ': '.")
+            return result
+
+        # Check for trailing period in subject
+        if m.group("subject").strip().endswith("."):
+            result["warnings"].append(
+                "Subject should not end with aperiod."
+            )
+
+        # Check subject doesn't start with uppercase
+        subj = m.group("subject").strip()
+        if subj and subj[0].isupper():
+            result["warnings"].append(
+                f"Subject '{subj}' should start with a lowercase letter."
+            )
+
+        # Multiple blank lines between header and body
+        if len(lines) > 1:
+            blank_count = 0
+            for line in lines[1:]:
+                if line.strip() == "":
+                    blank_count += 1
+                else:
+                    break
+            if blank_count == 0:
+                result["warnings"].append(
+                    "No blank line between header and body — "
+                    "add a blank line after the first line."
+                )
+            elif blank_count > 1:
+                result["warnings"].append(
+                    f"Multiple blank lines ({blank_count}) between header and body — "
+                    "only one is needed."
+                )
+
+        result["valid"] = len(result["errors"]) == 0
+    else:
+        result["matched"] = False
+        result["errors"].append(
+            f"Header does not match Conventional Commits format: '{header}'"
+        )
+        result["errors"].append(
+            "Expected format: <type>[(scope)][!]: <subject>"
+        )
+        result["errors"].append(
+            f"Allowed types: {', '.join(CONVENTIONAL_TYPES)}"
+        )
+
+        # Check for common mistakes
+        for pattern, advice in COMMON_MISTAKES:
+            if pattern.search(header):
+                result["warnings"].append(advice)
+
+    return result
+
+
+def display_lint_result(result: dict) -> int:
+    """Print lint results to stdout. Returns exit code (0=pass, 1=fail)."""
+    if result["valid"]:
+        print("✅ Commit message looks good!")
+        parts = [f"type={result['type']}"]
+        if result["scope"]:
+            parts.append(f"scope={result['scope']}")
+        if result["breaking"]:
+            parts.append("BREAKING CHANGE")
+        parts.append(f"subject=\"{result['subject']}\"")
+        print(f"   {', '.join(parts)}")
+    else:
+        print("❌ Commit message does NOT conform to Conventional Commits:")
+        for err in result["errors"]:
+            print(f"   ✗ {err}")
+
+    for warn in result["warnings"]:
+        print(f"   ⚠ {warn}")
+
+    return 0 if result["valid"] else 1
 
 
 if __name__ == "__main__":
