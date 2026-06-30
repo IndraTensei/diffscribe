@@ -21,13 +21,16 @@ No LLM. No cloud. No dependencies. Just smart heuristics and your diff.
 - ✏️ **Amend support** — `--amend` amends the last commit with the generated message
 - ⚙️ **Config file** — persistent settings via `.diffscribe.toml` or `.diffscribe.json`
 - 🛠️ **Git hook integration** — `--hook` installs a `prepare-commit-msg` hook for automatic commit messages
-- 🔍 **Dry-run mode** — `--dry-run` previews the commit message without actually committing
-- 📊 **ASCII diff bar** — `--verbose` now shows an ASCII visualization of additions vs deletions
-- 🏷️ **Type breakdown** — `--verbose` shows a per-type count (e.g. `feat:2, docs:1`)
-- ✍️ **Sign-off support** — `--signoff` adds a rich body with type-grouped files and a `Signed-off-by` line
-- 🎨 **Custom templates** — `--template` with placeholders like `{type}`, `{scope}`, `{subject}`, `{hash}`, `{date}`
-- 📜 **Commit history** — `--history` shows recent commits for style consistency
-- 🔍 **Commit linter** — `--lint` validates any message against the Conventional Commits v1.0.0 spec
+|- 🔍 **Dry-run mode** — `--dry-run` previews the commit message without actually committing
+|- 📊 **ASCII diff bar** — `--verbose` now shows an ASCII visualization of additions vs deletions
+|- 🏷️ **Type breakdown** — `--verbose` shows a per-type count (e.g. `feat:2, docs:1`)
+|- ✍️ **Sign-off support** — `--signoff` adds a rich body with type-grouped files and a `Signed-off-by` line
+|- 🎨 **Custom templates** — `--template` with placeholders like `{type}`, `{scope}`, `{subject}`, `{hash}`, `{date}`
+|- 📜 **Commit history** — `--history` shows recent commits for style consistency
+|- 🔍 **Commit linter** — `--lint` validates any message against the Conventional Commits v1.0.0 spec
+|- 📖 **Explain mode** — `--explain` shows why the detected type/scope were chosen
+|- 📊 **Compare mode** — `--compare REF` compares staged changes against a tag/branch and suggests a contextual message
+|- 👁️ **Watch mode** — `--watch` monitors file changes, auto-stages, and suggests commits when changes stabilize
 
 ## Installation
 
@@ -107,6 +110,9 @@ diffscribe [options]
 | `--template T` | `-T` | Custom output template (placeholders: `{emoji}` `{type}` `{scope}` `{subject}` `{files}` `{additions}` `{deletions}` `{branch}` `{repo}` `{hash}` `{date}`)|
 | `--history` | | Show recent commit history for style reference|
 | `--lint [MSG]` | | Lint a commit message against Conventional Commits spec (reads stdin if no argument, or pass a message/file path)|
+| `--explain` | | Show a plain-English explanation of why the detected type/scope were chosen|
+| `--compare REF` | | Compare staged changes against a tag/branch/commit and suggest a contextual message|
+| `--watch [SEC]` | | Watch for file changes, auto-stage, and suggest commits after changes stabilize (default: 2s)|
 | `--help` | `-h` | Show help|
 | `--version` | | Show version number|
 
@@ -223,6 +229,72 @@ diffscribe --lint /tmp/commit-msg.txt
 # ✅ Commit message looks good!
 #    type=fix, subject="resolve memory leak"
 ```
+
+### Explain why the type/scope were chosen
+
+```bash
+git add src/api/routes.py tests/test_routes.py
+diffscribe --explain
+# ✨ feat(api): add 2 files
+#
+# Changes:
+# - src/api/routes.py (+42/-0)
+# - tests/test_routes.py (+18/-0)
+#
+# [diffscribe] 42 additions, 0 deletions across 2 file(s)
+
+# 📖 Why this commit message?
+# ──────────────────────────────────────────────────
+#   • File classification found: test:1, feat:1
+#   • Dominant file type is 'feat', so the commit type is 'feat'
+#   • Branch 'main' did not follow conventional naming patterns
+#
+#   • Detected common directory 'src' in 1/2 files
+#   • Scope 'api' will appear as the parenthesized segment in the header
+#
+#   • 2 files changed — subject summarizes the group
+```
+
+### Compare staged changes against a ref
+
+```bash
+git add src/cache.py src/benchmark.py
+diffscribe --compare v1.2.0
+# 📊 Comparing staged changes against 'v1.2.0':
+# ────────────────────────────────────────────────────────────
+#   src/cache.py [Python] (+35/-4)
+#   src/benchmark.py [Python] (+20/-0)
+#
+#   Files changed: 2
+#   Insertions:    +55
+#   Deletions:     -4
+#
+#   Commits on HEAD since v1.2.0: 4
+#     a1b2c3d4 perf: add Redis cache layer
+#     ...
+#
+#   Suggested contextual message:
+#     perf(): add 2 files since a1b2c3d
+# ────────────────────────────────────────────────────────────
+```
+
+### Watch mode — auto-stage and suggest commits
+
+```bash
+diffscribe --watch
+# 👁️  Watching for changes... (Press Ctrl+C to stop)
+#     Auto-commit when changes stabilize for 2s
+#
+#   Detected 2 changed file(s):
+#     M src/api/handlers.py
+#     M tests/test_api.py
+#
+#   Changes stabilized. Staging 2 file(s)...
+#   Staged all changes.
+#
+#   Suggested: feat(api): update 2 Python files
+#   Type [y] to commit, [n] to skip, [e] to edit: y
+#   Committed.
 
 ### Full commit with verbose info
 

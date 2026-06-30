@@ -7,7 +7,7 @@ detects scope, and outputs a well-structured conventional commit message.
 No API keys, no AI models — just smart diff analysis.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import os
 import re
@@ -464,7 +464,7 @@ def _matches_any(text: str, patterns: list[str]) -> bool:
 # Git interaction
 # ---------------------------------------------------------------------------
 
-def _run_git(*args) -> str:
+def _run_git(*args, check: bool = True) -> str:
     """Run a git command and return stdout. Raises on failure."""
     cmd = ["git"] + list(args)
     try:
@@ -474,7 +474,7 @@ def _run_git(*args) -> str:
             text=True,
             timeout=30,
         )
-        if result.returncode != 0 and result.stderr:
+        if check and result.returncode != 0 and result.stderr:
             # Some git commands write to stderr for info; only raise on real errors
             if "fatal" in result.stderr.lower() or "error" in result.stderr.lower():
                 raise RuntimeError(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
@@ -1015,6 +1015,9 @@ examples:
   diffscribe -T "{type}{scope}: {subject} [{hash}]"  # Custom template
   diffscribe --history                 # Show recent commits for style reference
   diffscribe --lint "feat: add thing"  # Lint a commit message
+  diffscribe --explain                 # Explain why type/scope were chosen
+  diffscribe --compare v1.2.0          # Compare staged changes against a ref
+  diffscribe --watch 3                 # Watch for changes with 3s stabilization
         """,
     )
 
@@ -1130,6 +1133,26 @@ examples:
         help="Lint a commit message against Conventional Commits spec. Reads from stdin if no argument.",
     )
     parser.add_argument(
+        "--explain",
+        action="store_true",
+        default=False,
+        help="Show a plain-English explanation of why the detected type/scope were chosen",
+    )
+    parser.add_argument(
+        "--compare",
+        metavar="REF",
+        default=None,
+        help="Compare staged changes against a git ref (branch, tag, or commit) and suggest a contextual message",
+    )
+    parser.add_argument(
+        "--watch",
+        nargs="?",
+        const="2.0",
+        metavar="INTERVAL",
+        default=None,
+        help="Watch for file changes, auto-stage, and suggest commits when changes stabilize (default interval: 2s)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"diffscribe {__version__}",
@@ -1188,6 +1211,15 @@ examples:
     # Handle --hook separately (no staged changes needed)
     if args.hook:
         return 0 if install_hook(force=args.force) else 1
+
+    # Handle --watch separately (monitors working directory, not staged diff)
+    if args.watch is not None:
+        interval = float(args.watch)
+        return watch_mode(interval=interval)
+
+    # Handle --compare separately (compares staged diff against a ref)
+    if args.compare is not None:
+        return compare_with_ref(args.compare)
 
     # Check for staged changes
     staged_diff = get_staged_diff()
@@ -1287,6 +1319,11 @@ examples:
             print(f"Branch hint: type={branch_type}" + (f", scope={branch_scope}" if branch_scope else ""))
         print(f"Suggested:   {summary.suggested_type}" +
               (f"({summary.suggested_scope})" if summary.suggested_scope else ""))
+
+        # Show explanation inline with verbose
+        if args.explain:
+            explain_analysis(summary, branch_name, branch_type, branch_scope, args)
+
         print()
 
     # Handle --copy (copy to clipboard, optionally also print)
@@ -1354,6 +1391,11 @@ examples:
 
     # Default: just print the suggested message
     print(message_with_signoff)
+
+    # Show explanation if requested
+    if args.explain:
+        explain_analysis(summary, branch_name, branch_type, branch_scope, args)
+
     return 0
 
 
@@ -1631,6 +1673,290 @@ def display_lint_result(result: dict) -> int:
         print(f"   ⚠ {warn}")
 
     return 0 if result["valid"] else 1
+
+
+# ---------------------------------------------------------------------------
+# Explain mode — show why the detected type/scope was chosen
+# ---------------------------------------------------------------------------
+
+def explain_analysis(summary: DiffSummary, branch_name: str, branch_type: str,
+                     branch_scope: str, args) -> None:
+    """Print a plain-English explanation of how diffscribe arrived at its suggestions."""
+    lines = []
+    lines.append("")
+    lines.append("📖 Why this commit message?")
+    lines.append("─" * 50)
+
+    # Explain type detection
+    type_reasons = []
+    # Check what individual file types were found
+    type_counts: dict[str, int] = defaultdict(int)
+    for fc in summary.files:
+        if fc.change_type:
+            type_counts[fc.change_type] += 1
+
+    if type_counts:
+        breakdown = ", ".join(f"{t}: {c}" for t, c in sorted(type_counts.items(), key=lambda x: -x[1]))
+        type_reasons.append(f"File classification found: {breakdown}")
+        dominant = max(type_counts, key=lambda k: type_counts[k])
+        type_reasons.append(f"Dominant file type is '{dominant}', so the commit type is '{summary.suggested_type}'")
+
+    # Explain branch influence
+    if branch_name:
+        if branch_type:
+            if args.commit_type:
+                type_reasons.append(f"Branch '{branch_name}' suggests type='{branch_type}', but --type override applies")
+            else:
+                type_reasons.append(f"Branch '{branch_name}' matched pattern and contributed type='{branch_type}'")
+        if branch_scope:
+            if args.scope:
+                type_reasons.append(f"Branch '{branch_name}' suggests scope='{branch_scope}', but --scope override applies")
+            else:
+                type_reasons.append(f"Branch '{branch_name}' matched pattern and contributed scope='{branch_scope}'")
+        if not branch_type and not branch_scope:
+            type_reasons.append(f"Branch '{branch_name}' did not follow conventional naming patterns")
+
+    for reason in type_reasons:
+        lines.append(f"  • {reason}")
+
+    # Explain scope detection
+    lines.append("")
+    scope_reasons = []
+    if summary.suggested_scope:
+        # Reconstruct the scope logic
+        dirs: dict[str, int] = defaultdict(int)
+        for fc in summary.files:
+            parts = fc.path.split("/")
+            if len(parts) > 1:
+                dirs[parts[0]] += 1
+        if dirs:
+            scope_reasons.append(f"Detected common directory '{summary.suggested_scope}' in {dirs.get(summary.suggested_scope, 0)}/{len(summary.files)} files")
+        scope_reasons.append(f"Scope '{summary.suggested_scope}' will appear as the parenthesized segment in the header")
+    else:
+        scope_reasons.append("No common directory found across changed files — scope is omitted")
+
+    for reason in scope_reasons:
+        lines.append(f"  • {reason}")
+
+    # Explain subject generation
+    lines.append("")
+    if len(summary.files) == 1:
+        fc = summary.files[0]
+        if fc.is_new:
+            lines.append(f"  • Single new file detected — subject uses 'add' verb")
+        elif fc.is_deleted:
+            lines.append(f"  • Single file deletion detected — subject uses 'remove' verb")
+        else:
+            lines.append(f"  • Single modified file detected — subject uses 'update' verb")
+    else:
+        lines.append(f"  • {len(summary.files)} files changed — subject summarizes the group")
+
+    # Explain overrides
+    lines.append("")
+    if args.commit_type:
+        lines.append(f"  • Manual override: --type {args.commit_type} forced type (would have been '{determine_overall_type(summary.files)}')")
+    if args.scope:
+        lines.append(f"  • Manual override: --scope {args.scope} forced scope (would have been '{detect_scope(summary.files)}')")
+
+    lines.append("")
+    print("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Compare mode — show diff between staged changes and a target ref
+# ---------------------------------------------------------------------------
+
+def compare_with_ref(ref: str) -> int:
+    """
+    Show a diff comparison between the currently staged changes and a target ref.
+    Useful for generating contextual messages like "feat: 3 changes since v1.2.0".
+    Returns exit code.
+    """
+    try:
+        _run_git("rev-parse", ref)
+    except RuntimeError:
+        print(f"Error: Reference '{ref}' not found in this repository.", file=sys.stderr)
+        return 1
+
+    # Show stat of what's in the staged area vs the ref
+    try:
+        staged_stat = _run_git("diff", "--cached", "--stat").strip()
+    except RuntimeError:
+        print("Error: Could not read staged diff.", file=sys.stderr)
+        return 1
+
+    if not staged_stat:
+        print("No staged changes to compare.")
+        return 0
+
+    # Get log messages between the ref and HEAD for context
+    try:
+        commits_since = _run_git("log", "--oneline", f"{ref}..HEAD", check=False).strip()
+    except RuntimeError:
+        commits_since = ""
+
+    # Show the comparison
+    print(f"📊 Comparing staged changes against '{ref}':")
+    print("─" * 60)
+
+    # Parse the staged diff for the summary
+    stat_text = get_staged_diff(stat_only=True)
+    diff_text = get_staged_diff()
+
+    if not stat_text.strip():
+        print("Nothing to compare.")
+        return 0
+
+    summary = analyze(stat_text, diff_text)
+
+    # Show per-file summary
+    for fc in summary.files:
+        marker = ""
+        if fc.is_new:
+            marker = "(new)"
+        elif fc.is_deleted:
+            marker = "(deleted)"
+        lang = f"[{fc.language}]" if fc.language else ""
+        print(f"  {fc.path} {lang} (+{fc.additions}/-{fc.deletions}) {marker}".strip())
+
+    print()
+    print(f"  Files changed: {len(summary.files)}")
+    print(f"  Insertions:    +{summary.total_additions}")
+    print(f"  Deletions:     -{summary.total_deletions}")
+
+    if commits_since:
+        commit_lines = commits_since.splitlines()
+        print(f"\n  Commits on HEAD since {ref}: {len(commit_lines)}")
+        for cl in commit_lines[:5]:
+            print(f"    {cl}")
+        if len(commit_lines) > 5:
+            print(f"    ... and {len(commit_lines) - 5} more commits")
+
+    # Generate a contextual commit message
+    try:
+        ref_short = _run_git("rev-parse", "--short", ref).strip()
+    except RuntimeError:
+        ref_short = ref
+
+    type_verb = {
+        "feat": "add", "fix": "fix", "docs": "update docs",
+        "refactor": "refactor", "perf": "optimize", "test": "add tests",
+        "style": "format", "ci": "update CI", "chore": "update",
+    }
+    verb = type_verb.get(summary.suggested_type, "update")
+    file_word = "file" if len(summary.files) == 1 else "files"
+    suggested = f"{summary.suggested_type}({summary.suggested_scope or ''}): {verb} {len(summary.files)} {file_word} since {ref_short}"
+
+    print(f"\n  Suggested contextual message:")
+    print(f"    {suggested}")
+
+    print("─" * 60)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Watch mode — monitor file changes and auto-suggest commits
+# ---------------------------------------------------------------------------
+
+def watch_mode(interval: float = 2.0) -> int:
+    """
+    Watch the working directory for changes, auto-stage them, and suggest
+    a commit message when changes stabilize (no new changes for `interval` seconds).
+    Exits on Ctrl+C.
+    """
+    import time
+
+    try:
+        _run_git("rev-parse", "--is-inside-work-tree")
+    except RuntimeError:
+        print("Error: Not inside a git repository.", file=sys.stderr)
+        return 1
+
+    print("👁️  Watching for changes... (Press Ctrl+C to stop, Enter to commit now)")
+    print(f"    Auto-commit when changes stabilize for {interval}s\n")
+
+    last_change_time = time.time()
+    last_file_count = 0
+    watching = True
+    changes_detected = False
+
+    while watching:
+        try:
+            # Check for any changes (staged or unstaged)
+            status_output = _run_git("status", "--porcelain", check=False).strip()
+            modified = [line for line in status_output.splitlines() if line.strip()]
+
+            current_time = time.time()
+
+            if modified:
+                if not changes_detected:
+                    changes_detected = True
+                    print(f"  Detected {len(modified)} changed file(s):")
+                    for m in modified[:5]:
+                        print(f"    {m}")
+                    if len(modified) > 5:
+                        print(f"    ... and {len(modified) - 5} more")
+
+                last_change_time = current_time
+                last_file_count = len(modified)
+
+            # If changes have stabilized, generate a suggestion
+            if changes_detected and (current_time - last_change_time) >= interval:
+                print(f"\n  Changes stabilized. Staging {last_file_count} file(s)...")
+
+                # Auto-stage all changes
+                _run_git("add", "-A")
+                print("  Staged all changes.")
+
+                # Generate commit suggestion
+                stat_text = get_staged_diff(stat_only=True)
+                if stat_text.strip():
+                    diff_text = get_staged_diff()
+                    summary = analyze(stat_text, diff_text)
+
+                    branch_name = get_branch_name()
+                    branch_type, branch_scope = detect_from_branch(branch_name)
+                    if branch_type:
+                        summary.suggested_type = branch_type
+                    if branch_scope:
+                        summary.suggested_scope = branch_scope
+
+                    message = format_short_status(summary)
+                    print(f"\n  Suggested: {message}")
+                    print(f"  Type [y] to commit, [n] to skip, [e] to edit: ", end="", flush=True)
+
+                    try:
+                        response = input().strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\n  Stopped watching.")
+                        return 0
+
+                    if response in ("y", "yes", ""):
+                        full_msg = format_commit_message(summary)
+                        if do_commit(full_msg):
+                            print("  Committed.")
+                        else:
+                            print("  Commit failed.")
+                    elif response in ("e", "edit"):
+                        full_msg = format_commit_message(summary)
+                        edited = interactive_edit(full_msg)
+                        if edited and do_commit(edited):
+                            print("  Committed.")
+                        else:
+                            print("  Skipped or failed.")
+                    else:
+                        print("  Skipped. Unstaging...")
+                        _run_git("reset", "HEAD", check=False)
+
+                changes_detected = False
+
+            time.sleep(0.5)
+
+        except KeyboardInterrupt:
+            print("\n\n  Stopped watching.")
+            return 0
+
+    return 0
 
 
 if __name__ == "__main__":
